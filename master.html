@@ -54,6 +54,9 @@ main{max-width:720px;margin:0 auto;padding:10px 12px}
 .mini{min-height:36px;padding:0 12px;border-radius:8px;border:1px solid #b9a25f;background:#fff;color:#6b4d0f;font-size:13px;font-weight:700}
 .req.buy .mini{border-color:#7aa9c4;color:#1f4d68}
 .empty{background:#fff;border:1px solid var(--line);border-radius:10px;padding:22px 14px;text-align:center;color:var(--muted);font-size:14px;line-height:1.7}
+.loaderr{background:#fff0ed;border:1px solid #e8b4ac;color:#8f2a20;border-radius:10px;padding:10px 12px;font-size:14px;line-height:1.55;margin-bottom:10px}
+.loaderr small{display:block;color:#a7382d;opacity:.85;margin-top:4px;font-size:12px;overflow-wrap:anywhere}
+.srv{margin-top:10px;font-size:11px;color:var(--muted);text-align:center;overflow-wrap:anywhere}
 .rule{margin-top:14px;font-size:12px;color:var(--muted);line-height:1.6}
 .overlay{position:fixed;inset:0;background:rgba(20,37,54,.55);z-index:20;display:flex;align-items:center;justify-content:center;padding:20px}
 .panel{background:#fff;width:100%;max-width:380px;border-radius:14px;padding:20px 18px}
@@ -72,6 +75,7 @@ main{max-width:720px;margin:0 auto;padding:10px 12px}
   <div id="tabs" class="tabs"></div>
 </header>
 <main>
+  <div id="loadErr" class="loaderr hidden"></div>
   <div id="issueNote" class="note hidden"></div>
   <div id="intro" class="intro"></div>
   <input id="q" type="search" placeholder="번호·규격·위치로 찾기" autocomplete="off">
@@ -87,19 +91,22 @@ main{max-width:720px;margin:0 auto;padding:10px 12px}
     <div id="gateErr" class="err"></div>
     <button id="gateOk" class="btn">확인</button>
     <div style="text-align:center;margin-top:12px"><a href="./" class="muted">← 출고 화면으로</a></div>
+    <div id="srvInfo" class="srv"></div>
   </div>
 </div>
 <div id="toast"></div>
 
 <script>
-const API_URL = 'https://script.google.com/macros/s/AKfycbxRHvicONvIlxnjTudbnfHnkSFSrq8eFGUXM9VEmPUWtTte7J5fA-LVKoFOZ8fdhuy9/exec';
 const KEY = 'br_master_pin';
 const $ = id => document.getElementById(id);
+const lget = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const lset = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+// 서버 주소: 출고 화면(index.html)이 쓰는 주소를 그대로 따라갑니다. (출고 화면을 한 번도 안 연 폰에서만 아래 기본값 사용)
+const API_FALLBACK = 'https://script.google.com/macros/s/AKfycbxRHvicONvIlxnjTudbnfHnkSFSrq8eFGUXM9VEmPUWtTte7J5fA-LVKoFOZ8fdhuy9/exec';
+const API_URL = (lget('br_api_url') || '').startsWith('https://') ? lget('br_api_url') : API_FALLBACK;
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const norm = s => String(s || '').toLowerCase().replace(/[\s\-_.×*]/g, '');
 const p2 = n => String(n).padStart(2, '0');
-const lget = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
-const lset = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
 function fetchT(u, o = {}, ms = 25000) { const c = new AbortController(); const t = setTimeout(() => c.abort(), ms); return fetch(u, { ...o, signal: c.signal }).finally(() => clearTimeout(t)); }
 const post = obj => fetchT(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(obj) }).then(r => r.json());
 
@@ -109,37 +116,85 @@ const TABS = [
   { g: 'A', t: '자주' }, { g: 'B', t: '보통' }, { g: 'C', t: '가끔' }, { g: 'D', t: '이력 없음' }, { g: 'R', t: '구매 목록' }
 ];
 
-let pin = '', data = null, tab = 'A', q = '', loadedAt = 0, busy = false, tt;
+let pin = '', cands = [], data = null, tab = 'A', q = '', loadedAt = 0, busy = false, tt;
 
-// 출고 화면에서 이미 마스터 PIN으로 들어왔다면 그 PIN을 이어서 씁니다.
-function initialPin() {
+// 사용해 볼 PIN 후보: ① 방금 출고 화면에서 마스터로 로그인한 PIN ② 이 화면에 예전에 저장된 PIN
+// (마스터 PIN을 바꾼 뒤에도 ①이 먼저라서 다시 입력하지 않아도 되고, ①이 안 맞으면 ②를 시도합니다)
+function pinCandidates() {
+  const out = [];
+  try { if (JSON.parse(lget('br_role') || 'null') === 'master') { const p = JSON.parse(lget('br_pin') || '""'); if (p) out.push(String(p)); } } catch (e) {}
   const own = lget(KEY);
-  if (own) return own;
-  try { if (JSON.parse(lget('br_role') || 'null') === 'master') return JSON.parse(lget('br_pin') || '""') || ''; } catch (e) {}
-  return '';
+  if (own && out.indexOf(own) < 0) out.push(own);
+  return out;
 }
 const myName = () => { try { return JSON.parse(lget('br_name') || '""') || '마스터'; } catch (e) { return '마스터'; } };
+const srvTail = () => '…' + API_URL.replace(/\/exec$/, '').slice(-10);
 
 function toast(m) { const t = $('toast'); t.textContent = m; t.classList.add('show'); clearTimeout(tt); tt = setTimeout(() => t.classList.remove('show'), 2600); }
-function showGate(msg) { $('gateErr').textContent = msg || ''; $('gate').classList.remove('hidden'); setTimeout(() => $('pinIn').focus(), 50); }
+function showGate(msg) {
+  $('gateErr').textContent = msg || '';
+  $('srvInfo').textContent = '연결 서버 ' + srvTail() + (lget('br_api_url') ? ' (출고 화면과 같은 주소)' : ' (기본 주소)');
+  $('gate').classList.remove('hidden'); setTimeout(() => $('pinIn').focus(), 50);
+}
+function setErr(msg, detail) {
+  const e = $('loadErr');
+  if (!msg) { e.classList.add('hidden'); e.textContent = ''; return; }
+  e.innerHTML = esc(msg) + (detail ? '<small>' + esc(detail) + '</small>' : '');
+  e.classList.remove('hidden');
+}
+
+// 서버 코드가 구매 관리를 지원하는 최신 버전인지 확인 (PIN이 안 맞을 때 원인 구분용)
+async function serverInfo() {
+  try { const r = await fetchT(API_URL, {}, 12000); const j = await r.json(); return j && j.ok ? (j.master ? 'new' : 'old') : 'bad'; }
+  catch (e) { return 'down'; }
+}
+
+// 요청 한 번. 결과를 {ok, data} 또는 {kind, msg, detail} 로 정리합니다. (화면에 보이지 않게 실패하는 일이 없도록)
+async function call(p) {
+  let r, text;
+  try { r = await fetchT(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ pin: p, action: 'master' }) }, 30000); text = await r.text(); }
+  catch (e) { return { kind: 'NET', msg: '서버에 연결하지 못했습니다. 인터넷 상태를 확인하세요.', detail: String(e && e.name || e) }; }
+  let d; try { d = JSON.parse(text); }
+  catch (e) { return { kind: 'NOTJSON', msg: '서버가 올바른 응답을 주지 않았습니다. Apps Script 배포가 "실행 계정: 나 / 액세스: 모든 사용자"인지, 코드를 바꾼 뒤 [배포 관리 > 수정 > 새 버전]으로 배포했는지 확인하세요.', detail: 'HTTP ' + r.status + ' · ' + text.replace(/\s+/g, ' ').slice(0, 80) }; }
+  if (d.ok) return { ok: true, data: d };
+  return { kind: d.error || 'ERR', msg: d.msg || '', detail: d.error || '' };
+}
 
 async function load(manual) {
-  if (!pin) { showGate(''); return; }
   if (busy) return;
+  if (!pin && !cands.length) { showGate(''); return; }
   busy = true;
   try {
-    const d = await post({ pin, action: 'master' });
-    if (d.ok) {
-      data = d; loadedAt = Date.now(); lset(KEY, pin);
-      $('gate').classList.add('hidden');
+    let res = null, tried = '';
+    const list = pin ? [pin] : cands.slice();
+    for (const p of list) {
+      res = await call(p);
+      if (res.ok) { pin = p; break; }
+      if (res.kind !== 'PIN' && res.kind !== 'FORBIDDEN') break; // PIN 문제가 아니면 다른 PIN을 시도해도 소용없음
+      tried = res.kind;
+    }
+    cands = []; // 후보는 한 번만 사용
+    if (res.ok) {
+      data = res.data; loadedAt = Date.now(); lset(KEY, pin);
+      $('gate').classList.add('hidden'); setErr('');
       render();
       if (manual) toast('새로 불러왔습니다');
-    } else if (d.error === 'PIN') { pin = ''; showGate('PIN이 맞지 않습니다.'); }
-    else if (d.error === 'FORBIDDEN') { pin = ''; showGate('마스터 PIN이 아닙니다. (현장·관리자 PIN으로는 열 수 없습니다)'); }
-    else toast(d.msg || '불러오지 못했습니다');
+    } else if (res.kind === 'PIN' || res.kind === 'FORBIDDEN') {
+      pin = '';
+      let msg = res.kind === 'FORBIDDEN' ? '마스터 PIN이 아닙니다. (현장·관리자 PIN으로는 열 수 없습니다)' : 'PIN이 맞지 않습니다.';
+      const st = await serverInfo();
+      if (st === 'old') msg = '이 서버 주소는 구매 관리가 없는 예전 버전입니다. Apps Script에서 코드를 새로 붙여넣고 [배포 관리 > 수정 > 새 버전]으로 다시 배포해주세요.';
+      else if (st === 'new') msg += ' 스크립트 속성 MASTER_PIN 값(앞뒤 공백 없이)과 같은지 확인하세요.';
+      else if (st === 'down') msg += ' (서버 연결도 확인하지 못했습니다)';
+      showGate(msg);
+    } else {
+      const m = res.msg || '불러오지 못했습니다.';
+      if (!$('gate').classList.contains('hidden')) { pin = ''; $('gateErr').textContent = m + (res.detail ? ' [' + res.detail + ']' : ''); } // PIN 입력창이 떠 있으면 거기에 이유를 보여줌
+      else if (data) { toast(m); setErr(m, res.detail); }
+      else { $('sub').textContent = '불러오지 못했습니다'; setErr(m, res.detail + ' · 서버 ' + srvTail()); }
+    }
   } catch (e) {
-    toast('인터넷 연결을 확인하세요' + (data ? ' (마지막으로 불러온 내용 표시 중)' : ''));
-    if (!data) $('sub').textContent = '불러오지 못했습니다 · 새로고침을 눌러주세요';
+    setErr('화면을 그리는 중 오류가 발생했습니다.', String(e && e.message || e));
   } finally { busy = false; }
 }
 
@@ -153,11 +208,11 @@ function renderTabs() {
 }
 
 function intro() {
-  const st = data.settings, s = data.summary, y = st.years;
-  if (tab === 'A') return `최근 ${y}년간 <b>${st.aMin}회 이상</b> 구매한 자주 쓰는 베어링 ${s.A.total}종 중, 재고가 ${st.aStock}개 이하인 ${s.A.low}종입니다. 가장 먼저 채워야 합니다.`;
-  if (tab === 'B') return `최근 ${y}년간 <b>${st.bMin}~${st.aMin - 1}회</b> 구매한 베어링 ${s.B.total}종 중, 재고 ${st.bStock}개 이하 ${s.B.low}종입니다.`;
-  if (tab === 'C') return `최근 ${y}년간 <b>${st.cMin}~${st.bMin - 1}회</b> 구매한 가끔 쓰는 베어링 ${s.C.total}종 중, 재고 ${st.cStock}개 이하 ${s.C.low}종입니다. 채우는 데 시간 여유가 있습니다.`;
-  if (tab === 'D') return `최근 ${y}년간 구매 이력이 없는 베어링 ${s.D.total}종 중 재고가 없는 ${s.D.low}종입니다. 알림은 가지 않으며 참고용입니다.`;
+  const st = data.settings, s = data.summary;
+  if (tab === 'A') return `구매횟수 <b>${st.aMin}회 이상</b>인 자주 쓰는 베어링 ${s.A.total}종 중, 재고가 ${st.aStock}개 이하인 ${s.A.low}종입니다. 가장 먼저 채워야 합니다.`;
+  if (tab === 'B') return `구매횟수 <b>${st.bMin}~${st.aMin - 1}회</b>인 베어링 ${s.B.total}종 중, 재고 ${st.bStock}개 이하 ${s.B.low}종입니다.`;
+  if (tab === 'C') return `구매횟수 <b>${st.cMin}~${st.bMin - 1}회</b>인 가끔 쓰는 베어링 ${s.C.total}종 중, 재고 ${st.cStock}개 이하 ${s.C.low}종입니다. 채우는 데 시간 여유가 있습니다.`;
+  if (tab === 'D') return `구매횟수가 0회(구매 이력 없음)인 베어링 ${s.D.total}종 중 재고가 없는 ${s.D.low}종입니다. 알림은 가지 않으며 참고용입니다.`;
   return '구매대기·구매 버튼으로 담아 둔 목록입니다. 입고가 기록되면 자동으로 사라집니다.';
 }
 
@@ -169,7 +224,7 @@ function card(it) {
   return '<div class="card g' + it.g + '" data-c="' + esc(it.c) + '">' +
     '<div class="top"><div><div class="nm">' + esc(it.n) + '</div><div class="muted">' + (cn ? esc(cn) + ' · ' : '') + esc(it.c) + (it.s ? ' · ' + esc(it.s) : '') + (it.l ? ' · ' + esc(it.l) : '') + '</div></div>' +
     '<div class="stock' + warn + '">' + it.k + '<small>재고</small></div></div>' +
-    '<div class="meta">최근 ' + data.settings.years + '년 구매 <b>' + it.cnt + '회</b> · ' + it.g + '등급</div>' +
+    '<div class="meta">구매 <b>' + it.cnt + '회</b> · ' + it.g + '등급</div>' +
     (r ? '<div class="req' + (r.st === '구매요청' ? ' buy' : '') + '"><span>' + esc(r.st) + ' · ' + esc(r.q) + '개</span><button class="mini" data-act="cancel" data-id="' + esc(r.id) + '">취소</button></div>' : '') +
     '<div class="act"><div class="stepper"><button data-act="dec" aria-label="수량 줄이기">−</button><input type="number" inputmode="numeric" min="1" value="' + esc(qv) + '" aria-label="수량"><button data-act="inc" aria-label="수량 늘리기">＋</button></div>' +
     '<button class="btn" data-act="wait">구매대기</button><button class="btn buy" data-act="buy">구매</button></div></div>';
@@ -186,11 +241,11 @@ function reqCard(r) {
 function render() {
   if (!data) return;
   const at = new Date(loadedAt);
-  $('sub').textContent = p2(at.getHours()) + ':' + p2(at.getMinutes()) + ' 기준 · 등급은 최근 ' + data.settings.years + '년 구매횟수로 자동 계산';
+  $('sub').textContent = p2(at.getHours()) + ':' + p2(at.getMinutes()) + ' 기준 · 등급은 구매횟수로 자동 계산';
   renderTabs();
   $('intro').innerHTML = intro();
   $('issueNote').classList.toggle('hidden', !(data.issues > 0));
-  $('issueNote').textContent = '구매횟수 탭에 품목과 연결되지 않은 줄이 ' + data.issues + '개 있습니다. 구글 시트 메뉴 [베어링 관리 > 구매횟수 확인]을 실행해 E열을 확인하세요. 연결되지 않은 품목은 구매이력이 없는 D로 분류됩니다.';
+  $('issueNote').textContent = '구매횟수 탭에 품목과 연결되지 않은 줄이 ' + data.issues + '개 있습니다. 구글 시트 메뉴 [베어링 관리 > 구매횟수 확인]을 실행해 E열을 확인하세요. 연결되지 않은 품목은 구매횟수 0회(D)로 분류됩니다.';
   const kw = q.split(/\s+/).map(norm).filter(Boolean);
   const hit = it => kw.every(t => norm((it.c || '') + (it.n || '') + (it.s || '') + (it.l || '')).includes(t));
   let html;
@@ -205,7 +260,7 @@ function render() {
   $('list').innerHTML = html;
   window.scrollTo(0, y);
   const st = data.settings;
-  $('rule').textContent = `등급 기준(최근 ${st.years}년 구매횟수): A ${st.aMin}회 이상 · B ${st.bMin}~${st.aMin - 1}회 · C ${st.cMin}~${st.bMin - 1}회 · D 0회. 기준과 알림 재고는 시트의 [설정] 탭에서 바꿀 수 있습니다. 구매횟수는 과거 입력값에 앞으로 기록되는 입고 건수가 더해집니다.`;
+  $('rule').textContent = `등급 기준(구매횟수): A ${st.aMin}회 이상 · B ${st.bMin}~${st.aMin - 1}회 · C ${st.cMin}~${st.bMin - 1}회 · D 0회. 기준과 알림 재고는 시트의 [설정] 탭에서 바꿀 수 있습니다. 구매 입고가 기록될 때마다 그 베어링의 구매횟수가 1씩 올라갑니다.`;
 }
 
 // ---- 구매 요청 ----
@@ -226,7 +281,7 @@ async function addReq(card, mode) {
       if (i >= 0) data.requests[i] = rec; else data.requests.unshift(rec);
       toast(mode === 'buy' ? '구매 요청을 기록했습니다' : '구매대기에 담았습니다');
       render();
-    } else if (d.error === 'PIN' || d.error === 'FORBIDDEN') { pin = ''; showGate('PIN을 다시 입력해주세요.'); }
+    } else if (d.error === 'PIN' || d.error === 'FORBIDDEN') { pin = ''; showGate('PIN이 바뀐 것 같습니다. 마스터 PIN을 다시 입력해주세요.'); }
     else { toast(d.msg || '기록하지 못했습니다'); card.querySelectorAll('button').forEach(b => b.disabled = false); }
   } catch (e) { toast('인터넷 연결을 확인하세요'); card.querySelectorAll('button').forEach(b => b.disabled = false); }
 }
@@ -257,11 +312,11 @@ $('list').addEventListener('click', e => {
 });
 $('list').addEventListener('focusin', e => { if (e.target.matches('.stepper input')) e.target.select(); });
 $('refresh').onclick = () => load(true);
-$('gateOk').onclick = () => { const v = $('pinIn').value.trim(); if (!v) { $('gateErr').textContent = 'PIN을 입력하세요.'; return; } pin = v; $('gateErr').textContent = ''; load(false); };
+$('gateOk').onclick = () => { const v = $('pinIn').value.trim(); if (!v) { $('gateErr').textContent = 'PIN을 입력하세요.'; return; } pin = v; $('gateErr').textContent = '확인 중…'; load(false); };
 $('pinIn').addEventListener('keydown', e => { if (e.key === 'Enter') $('gateOk').click(); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden && data && Date.now() - loadedAt > 60000) load(false); });
 
-pin = initialPin();
+cands = pinCandidates();
 load(false);
 </script>
 </body>
